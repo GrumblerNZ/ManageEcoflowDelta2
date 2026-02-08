@@ -1,0 +1,8 @@
+# This file is used to specify dependencies for your Python project.
+# Add required packages, one per line. Example:
+# requests
+
+# Enphase Envoy API key eyJraWQiOiI3ZDEwMDA1ZC03ODk5LTRkMGQtYmNiNC0yNDRmOThlZTE1NmIiLCJ0eXAiOiJKV1QiLCJhbGciOiJFUzI1NiJ9.eyJhdWQiOiJ1bi1jb21taXNzaW9uZWQiLCJpc3MiOiJFbnRyZXoiLCJlbnBoYXNlVXNlciI6ImVucGhhc2UiLCJleHAiOjE3NTE4Mjc5NzAsImlhdCI6MTc1MTc4NDc3MCwianRpIjoiODlmMzIzYTUtNDMxYy00MmYxLWI4NGQtNzE0YmEyOTVjOGYxIiwidXNlcm5hbWUiOiJ0ZHVyZ2FwYWxAZW5waGFzZWVuZXJneS5jb20ifQ.GWBDmWQClIrC-EvidlCNhdxKn7PHnJ7L-vcj2PQzUE7Pbb6oZQU9tWGbwOEwQ_924p3E5zVhKIZ6XGgLZtf2OQ
+# Serial Number: 122414004333
+
+# Ecoflow MAC Address: 98-3D-AE-34-53-14, 98-3D-AE-3E-B7-FC

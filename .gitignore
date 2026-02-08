@@ -1,0 +1,2 @@
+# Ignore local config and secrets
+config/secrets.json
