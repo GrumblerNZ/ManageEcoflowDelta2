@@ -7,6 +7,7 @@ import time
 import hmac
 import paho.mqtt.client as mqtt
 import ssl
+import os
 
 def hmac_sha256(secret_key_string, message_string):
     """
@@ -272,8 +273,9 @@ def _sign_get(prefix: str) -> dict:
         "sign":      sig,
     }
 
+"""
 def get_mqtt_credentials() -> dict:
-    """Call the certification endpoint to get temporary MQTT credentials."""
+    #Call the certification endpoint to get temporary MQTT credentials."
     url     = f"{ECOFLOW_API_URL}/iot-open/sign/certification"
     headers = _sign_get("")          # no body prefix for GET
     resp    = requests.get(url, headers=headers, timeout=10)
@@ -282,85 +284,116 @@ def get_mqtt_credentials() -> dict:
     if result.get("code") != "0":
         raise RuntimeError(f"MQTT cert error: {result}")
     return result["data"]            # certificateAccount, certificatePassword, url, port, protocol
+"""
 
+def get_mqtt_credentials():
+    """
+    Get MQTT credentials with local file caching (refreshes every 2 hours)
+    """
+    cache_file = "mqtt_creds.json"
+    max_age_seconds = 2 * 3600   # 2 hours
+
+    # Try to load from cache
+    if os.path.exists(cache_file):
+        with open(cache_file, "r") as f:
+            creds = json.load(f)
+        
+        # Check if cache is still valid
+        if time.time() - creds.get("timestamp", 0) < max_age_seconds:
+            print("Using cached MQTT credentials")
+            return creds
+        else:
+            print("MQTT credentials expired, fetching new ones...")
+
+    # Cache is expired or doesn't exist → fetch new credentials
+    nonce = str(random.randint(100000, 999999))
+    timestamp = str(int(time.time() * 1000))
+    msg = f"accessKey={secrets['ecoFlow']['access_key']}&nonce={nonce}&timestamp={timestamp}"
+    sig = hmac.new(secrets["ecoFlow"]["secret_key"].encode(), msg.encode(), hashlib.sha256).hexdigest()
+
+    headers = {
+        "accessKey": secrets["ecoFlow"]["access_key"],
+        "nonce": nonce,
+        "timestamp": timestamp,
+        "sign": sig,
+    }
+
+    url = f"{secrets['ecoFlow']['api_url']}/iot-open/sign/certification"
+    resp = requests.get(url, headers=headers, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+
+    if data.get("code") != "0":
+        raise RuntimeError(f"MQTT cert error: {data}")
+
+    creds = data["data"]
+    creds["timestamp"] = time.time()   # Add timestamp for caching
+
+    # Save to local file
+    with open(cache_file, "w") as f:
+        json.dump(creds, f, indent=2)
+
+    print("New MQTT credentials saved to mqtt_creds.json")
+    return creds
 
 
 
 # ── MQTT charging control ─────────────────────────────────────────────────────
 def set_ac_charging_mqtt(sn: str, enable: bool, max_watts: int = 1200):
-    """
-    Send acChgCfg via MQTT — the only method that actually works on Delta 2.
-    moduleType 5 + chgWatts is correct for the Delta 2 over MQTT.
-    """
-    creds = get_mqtt_credentials()
+    creds = get_mqtt_credentials()   # ← Now uses cached version
 
     command_topic = f"/open/{creds['certificateAccount']}/{sn}/set"
     clamped = max(200, min(1200, max_watts))
 
     if enable:
-        # Set wattage, leave pause flag alone (255 = ignored)
-        params = {
-            "chgWatts":     clamped,
-            "chgPauseFlag": 255,   # 255 = "don't change this field"
-        }
+        params = {"chgWatts": clamped, "chgPauseFlag": 255}
     else:
-        # Pause charging, leave wattage alone
-        params = {
-            "chgWatts":     255,   # 255 = "don't change this field"
-            "chgPauseFlag": 1,     # 1 = pause
-        }
+        params = {"chgWatts": 255, "chgPauseFlag": 1}
 
     payload = json.dumps({
-        "id":          str(int(time.time() * 1000)),
-        "version":     "1.0",
-        "sn":          sn,
-        "moduleType":  5,           # correct for Delta 2
+        "id": str(int(time.time() * 1000)),
+        "version": "1.0",
+        "sn": sn,
+        "moduleType": 5,
         "operateType": "acChgCfg",
-        "params":      params,
+        "params": params,
     })
 
     result = {"success": False, "error": None}
 
-    def on_connect(client, userdata, flags, rc):
-        if rc == 0:
-            print(f"MQTT connected, publishing to {command_topic}")
+    def on_connect(client, userdata, flags, reason_code, properties):
+        if reason_code == 0:
             client.publish(command_topic, payload, qos=1)
         else:
-            result["error"] = f"MQTT connect failed: rc={rc}"
+            result["error"] = f"MQTT connect failed: {reason_code}"
             client.disconnect()
 
-    def on_publish(client, userdata, mid):
-        print("Command published successfully")
+    def on_publish(client, userdata, mid, reason_code=None, properties=None):
         result["success"] = True
         client.disconnect()
 
-    client = mqtt.Client(client_id=f"python-{random.randint(1000,9999)}", protocol=mqtt.MQTTv311)
+    client = mqtt.Client(
+        client_id=f"python-{random.randint(1000,9999)}",
+        callback_api_version=mqtt.CallbackAPIVersion.VERSION2,   # Modern v2
+    )
     client.username_pw_set(creds["certificateAccount"], creds["certificatePassword"])
-
-    # TLS — EcoFlow MQTT runs on port 8883 with SSL
     client.tls_set(cert_reqs=ssl.CERT_REQUIRED, tls_version=ssl.PROTOCOL_TLS)
     client.on_connect = on_connect
     client.on_publish = on_publish
 
-    broker_url = creds.get("url", "mqtt-e.ecoflow.com")
-    port       = int(creds.get("port", 8883))
-
-    print(f"Connecting to MQTT broker {broker_url}:{port}")
-    client.connect(broker_url, port, keepalive=30)
+    print(f"Connecting to MQTT broker mqtt-e.ecoflow.com:8883")
+    client.connect("mqtt-e.ecoflow.com", 8883, keepalive=30)
     client.loop_start()
 
-    # Wait up to 10 seconds for publish + disconnect
-    deadline = time.time() + 10
+    deadline = time.time() + 12
     while time.time() < deadline and not result["success"] and not result["error"]:
         time.sleep(0.1)
     client.loop_stop()
 
     if result["error"]:
         raise RuntimeError(result["error"])
-    if not result["success"]:
-        raise RuntimeError("MQTT publish timed out")
-
     return result
+
 
 def publish_mqtt(creds, sn, payload_dict):
     """Helper to publish a single MQTT message and wait for confirmation."""

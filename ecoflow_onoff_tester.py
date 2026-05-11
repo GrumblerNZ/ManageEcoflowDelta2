@@ -161,7 +161,8 @@ def set_ac_charging(serial_number, enable: bool, max_watts: int = None):
         "sn": serial_number,
         "moduleType": 5,
         "operateType": "acChgCfg",
-        "params": params
+        "params": params,
+        "from": "iOS"   # or "Android"
     }
 
     print("Sending payload:")
