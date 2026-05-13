@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-EcoFlow Delta 2 Smart Charger - SAFE PRODUCTION VERSION
-- 6-hour MQTT credential caching
-- 5-minute check interval during solar hours
-- Very reliable long-term
+EcoFlow Delta 2 Smart Charger - PRODUCTION VERSION
+- ONE persistent MQTT connection (best practice)
+- 2-hour credential caching
 """
 
 import json
@@ -17,7 +16,6 @@ import ssl
 import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
-
 
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -54,101 +52,98 @@ TELEGRAM_CHAT_ID = secrets.get("telegram", {}).get("chat_id")
 last_state = None
 last_watts = 0
 
+# ====================== PERSISTENT MQTT CLIENT ======================
+mqtt_client = None
 mqtt_creds = None
 mqtt_creds_time = 0
 
-def get_mqtt_credentials():
-    """
-    Get MQTT credentials with local file caching (refreshes every 2 hours)
-    """
-    cache_file = "mqtt_creds.json"
-    max_age_seconds = 2 * 3600   # 2 hours
-
-    # Try to load from cache
-    if os.path.exists(cache_file):
-        with open(cache_file, "r") as f:
-            creds = json.load(f)
-        
-        # Check if cache is still valid
-        if time.time() - creds.get("timestamp", 0) < max_age_seconds:
-            print("Using cached MQTT credentials")
-            return creds
-        else:
-            print("MQTT credentials expired, fetching new ones...")
-
-    # Cache is expired or doesn't exist → fetch new credentials
+def get_mqtt_credentials(force_refresh=False):
+    global mqtt_creds, mqtt_creds_time
+    
+    if not force_refresh and mqtt_creds and (time.time() - mqtt_creds_time) < 21600:  # 6 hours
+        return mqtt_creds
+    
     nonce = str(random.randint(100000, 999999))
     timestamp = str(int(time.time() * 1000))
     msg = f"accessKey={secrets['ecoFlow']['access_key']}&nonce={nonce}&timestamp={timestamp}"
     sig = hmac.new(secrets["ecoFlow"]["secret_key"].encode(), msg.encode(), hashlib.sha256).hexdigest()
-
+    
     headers = {
         "accessKey": secrets["ecoFlow"]["access_key"],
         "nonce": nonce,
         "timestamp": timestamp,
         "sign": sig,
     }
-
-    url = f"{secrets['ecoFlow']['api_url']}/iot-open/sign/certification"
+    
+    url = f"{ECOFLOW_API_URL}/iot-open/sign/certification"
     resp = requests.get(url, headers=headers, timeout=10)
     resp.raise_for_status()
     data = resp.json()
-
+    
     if data.get("code") != "0":
         raise RuntimeError(f"MQTT cert error: {data}")
+    
+    mqtt_creds = data["data"]
+    mqtt_creds_time = time.time()
+    return mqtt_creds
 
-    creds = data["data"]
-    creds["timestamp"] = time.time()   # Add timestamp for caching
-
-    # Save to local file
-    with open(cache_file, "w") as f:
-        json.dump(creds, f, indent=2)
-
-    print("New MQTT credentials saved to mqtt_creds.json")
-    return creds
-
+def init_mqtt_connection():
+    """Initialize ONE persistent MQTT connection"""
+    global mqtt_client
+    
+    if mqtt_client and mqtt_client.is_connected():
+        return mqtt_client
+    
+    creds = get_mqtt_credentials()
+    
+    mqtt_client = mqtt.Client(
+        client_id=f"delta2-persistent-{random.randint(1000,9999)}",
+        callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+    )
+    mqtt_client.username_pw_set(creds["certificateAccount"], creds["certificatePassword"])
+    mqtt_client.tls_set(cert_reqs=ssl.CERT_REQUIRED, tls_version=ssl.PROTOCOL_TLS)
+    
+    def on_connect(client, userdata, flags, reason_code, properties):
+        if reason_code == 0:
+            print("✅ MQTT connected successfully (persistent connection)")
+        else:
+            print(f"❌ MQTT connection failed: {reason_code}")
+    
+    def on_disconnect(client, userdata, flags, reason_code, properties):
+        print("⚠️ MQTT disconnected - will reconnect automatically")
+    
+    mqtt_client.on_connect = on_connect
+    mqtt_client.on_disconnect = on_disconnect
+    
+    broker = creds.get("url", "mqtt-e.ecoflow.com")
+    port = int(creds.get("port", 8883))
+    
+    print(f"Connecting to MQTT broker {broker}:{port} (persistent)...")
+    mqtt_client.connect(broker, port, keepalive=60)
+    mqtt_client.loop_start()
+    
+    # Wait for connection
+    time.sleep(3)
+    return mqtt_client
 
 def publish_mqtt_command(sn: str, payload_dict: dict):
+    """Send command using the persistent connection"""
+    global mqtt_client
+    
+    if not mqtt_client or not mqtt_client.is_connected():
+        print("Reconnecting MQTT...")
+        init_mqtt_connection()
+    
     creds = get_mqtt_credentials()
     command_topic = f"/open/{creds['certificateAccount']}/{sn}/set"
     payload = json.dumps(payload_dict)
-    result = {"success": False, "error": None}
-
-    def on_connect(client, userdata, flags, reason_code, properties):
-        if reason_code == 0:
-            client.publish(command_topic, payload, qos=1)
-        else:
-            result["error"] = f"MQTT connect failed: {reason_code}"
-            client.disconnect()
-
-    def on_publish(client, userdata, mid, reason_code=None, properties=None):
-        result["success"] = True
-        client.disconnect()
-
-    client = mqtt.Client(client_id=f"delta2-controller-{random.randint(1000,9999)}", callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
-    client.username_pw_set(creds["certificateAccount"], creds["certificatePassword"])
-    client.tls_set(cert_reqs=ssl.CERT_REQUIRED, tls_version=ssl.PROTOCOL_TLS)
-    client.on_connect = on_connect
-    client.on_publish = on_publish
-    client.connect("mqtt-e.ecoflow.com", 8883, keepalive=30)
-    client.loop_start()
-    deadline = time.time() + 10
-    while time.time() < deadline and not result["success"] and not result["error"]:
-        time.sleep(0.1)
-    client.loop_stop()
     
-    if result["error"]:
-        # One retry with fresh credentials
-        creds = get_mqtt_credentials()
-        client.username_pw_set(creds["certificateAccount"], creds["certificatePassword"])
-        client.connect("mqtt-e.ecoflow.com", 8883, keepalive=30)
-        client.loop_start()
-        time.sleep(3)
-        client.loop_stop()
+    result = mqtt_client.publish(command_topic, payload, qos=1)
     
-    if result["error"]:
-        raise RuntimeError(result["error"])
-    return result
+    if result.rc != 0:
+        raise RuntimeError(f"MQTT publish failed: {result.rc}")
+    
+    return True
 
 # ====================== TELEGRAM NOTIFICATIONS ======================
 def send_telegram(text: str):
@@ -216,27 +211,39 @@ def get_excess_solar_watts():
             export_power = 0
     return -export_power
 
+
+
+
 def should_charge(soc, excess_solar, isCharging, chargeWatt):
-    MIN_START_EXCESS = 350
-    MIN_CONTINUE_EXCESS = 150
-    RAMP_UP_THRESHOLD = 500
-
-    newChargeWatt = chargeWatt
-
-    if soc >= 95:
-        return False, newChargeWatt
+    """
+    Smart charging logic - NO SOC safety check.
+    Uses true_available = chargeWatt + excess_solar for accurate decision making.
+    """
+    MIN_CHARGE = 200
+    MAX_CHARGE = 1200
+    BUFFER = 100   # Leave ~100W buffer for house loads
 
     if isCharging:
-        if excess_solar < MIN_CONTINUE_EXCESS:
-            return False, 200
-        if excess_solar > RAMP_UP_THRESHOLD and chargeWatt < 900:
-            newChargeWatt = min(900, chargeWatt + 100)
-            return True, newChargeWatt
-        return True, newChargeWatt
+        # === Already charging ===
+        true_available = chargeWatt + excess_solar
+        new_target = true_available - BUFFER
+        new_target = max(MIN_CHARGE, min(MAX_CHARGE, new_target))
+        new_target = (new_target // 100) * 100   # Round to nearest 100
+
+        if new_target < MIN_CHARGE:
+            return False, MIN_CHARGE
+        return True, new_target
+
     else:
-        if excess_solar > MIN_START_EXCESS:
-            return True, 200
+        # === Not currently charging ===
+        if excess_solar > 350:
+            new_target = excess_solar - 200
+            new_target = max(MIN_CHARGE, min(MAX_CHARGE, new_target))
+            new_target = (new_target // 100) * 100
+            return True, new_target
         return False, 200
+    
+    
 
 # ====================== MQTT FUNCTIONS ======================
 def enable_backup_reserve(reserve_pct: int = 25, soc=0, excess=0, target_watts=0):
@@ -298,33 +305,53 @@ def control_charging():
     hour = now.hour
     minute = now.minute
 
-    # 07:00 AM sharp - Force OFF
+    # === 07:00 AM sharp - Force OFF (Solar only) ===
     if hour == 7 and minute == 0:
-        print("07:00 AM → Force OFF")
-        disable_backup_reserve(25, 0, 0)
-        time.sleep(600) #10 minutes
+        quota = get_current_quota()
+        is_charging = quota.get("inv.inputWatts", 0) > 50 if quota else False
+
+        if is_charging:
+            print("07:00 AM → Force OFF (Solar only)")
+            disable_backup_reserve(25, 0, 0)
+        else:
+            print("07:00 AM → Status quo: Already Solar only")
+        time.sleep(600)
         return
 
-    # 16:00 (4:00 PM) sharp - Force OFF
+    # === 16:00 (4:00 PM) sharp - Force OFF (Solar only) ===
     if hour == 16 and minute == 0:
-        print("16:00 → Force OFF")
-        disable_backup_reserve(25, 0, 0)
-        time.sleep(900) #15 minutes
+        quota = get_current_quota()
+        is_charging = quota.get("inv.inputWatts", 0) > 50 if quota else False
+
+        if is_charging:
+            print("16:00 → Force OFF (Solar only)")
+            disable_backup_reserve(25, 0, 0)
+        else:
+            print("16:00 → Status quo: Already Solar only")
+        time.sleep(900)
         return
 
-    # Night charging: 21:00 → 07:00
+    # === Night charging: 21:00 → 07:00 ===
     if hour >= 21 or hour < 7:
-        print("Night mode → Force charging ON")
-        enable_backup_reserve(30, 0, 0, 0)
-        set_ac_charging_power(800, 0, 0)
-        time.sleep(900) #15 minutes
+        quota = get_current_quota()
+        is_charging = quota.get("inv.inputWatts", 0) > 50 if quota else False
+        current_charge_watt = quota.get("mppt.cfgChgWatts", 200) if quota else 0
+
+        if not is_charging or abs(current_charge_watt - 800) > 50:
+            print(f"[{now.strftime('%H:%M')}] Night mode → Force charging ON at 800W")
+            enable_backup_reserve(30, 0, 0, 0)
+            set_ac_charging_power(800, 0, 0)
+        else:
+            print(f"[{now.strftime('%H:%M')}] Night mode → Status quo: Charging at {current_charge_watt}W")
+        
+        time.sleep(900)
         return
 
-    # Smart solar window: 10:30 → 16:00 (every 5 minutes)
+        # === Smart solar window: 10:30 → 16:00 ===
     if (hour == 10 and minute >= 30) or (11 <= hour <= 15) or (hour == 16 and minute < 0):
         quota = get_current_quota()
         if not quota:
-            print("⚠️ Could not fetch quota")
+            print(f"[{now.strftime('%H:%M')}] ⚠️ Could not fetch quota")
             time.sleep(300)
             return
 
@@ -337,13 +364,26 @@ def control_charging():
 
         should_charge_now, target_watts = should_charge(soc, excess, is_charging, current_charge_watt)
 
+        # === Status Quo Check ===
         if should_charge_now:
-            print(f"   → Charging at {target_watts}W")
-            enable_backup_reserve(30, soc, excess, target_watts)
-            set_ac_charging_power(target_watts, soc, excess)
+            if not is_charging:
+                # Transitioning from Solar → AC charging
+                print(f"[{now.strftime('%H:%M')}]    → Starting AC charging at {target_watts}W")
+                enable_backup_reserve(30, soc, excess, target_watts)
+                set_ac_charging_power(target_watts, soc, excess)
+            else:
+                # Already charging — check if we really need to change the power
+                if abs(target_watts - current_charge_watt) >= 50:
+                    print(f"[{now.strftime('%H:%M')}]    → Changing charge rate from {current_charge_watt}W to {target_watts}W")
+                    set_ac_charging_power(target_watts, soc, excess)
+                else:
+                    print(f"[{now.strftime('%H:%M')}]    → Status quo: Charging at {current_charge_watt}W (no change needed)")
         else:
-            print("   → Solar only")
-            disable_backup_reserve(25, soc, excess)
+            if is_charging:
+                print(f"[{now.strftime('%H:%M')}]    → Stopping charging (Solar only)")
+                disable_backup_reserve(25, soc, excess)
+            else:
+                print(f"[{now.strftime('%H:%M')}]    → Status quo: Solar only (no change needed)")
 
         time.sleep(60)  # 1 minute before next check
         return
@@ -352,11 +392,21 @@ def control_charging():
     disable_backup_reserve(25, 0, 0)
     time.sleep(300)
 
+def shutdown_mqtt():
+    """Call this on clean exit."""
+    global mqtt_client, mqtt_connected
+    if mqtt_client:
+        mqtt_client.loop_stop()
+        mqtt_client.disconnect()
+        mqtt_client = None
+        mqtt_connected = False
+
 # ====================== MAIN ======================
 if __name__ == "__main__":
     print("🚀 EcoFlow Delta 2 Smart Charger started (SAFE VERSION)")
     send_telegram("🚀 <b>EcoFlow Delta 2 Controller started</b> (Safe 6-hour caching + 5-min checks)")
 
+try:
     while True:
         try:
             control_charging()
@@ -364,3 +414,8 @@ if __name__ == "__main__":
             print(f"Error: {e}")
             send_telegram(f"⚠️ Error: {e}")
             time.sleep(300)
+except KeyboardInterrupt:
+    print("\n🛑 Shutting down gracefully (CTRL+C pressed)...")
+finally:
+    shutdown_mqtt()
+    print("✅ MQTT connection closed cleanly.")
