@@ -52,6 +52,10 @@ TELEGRAM_CHAT_ID = secrets.get("telegram", {}).get("chat_id")
 last_state = None
 last_watts = 0
 
+MIN_CHARGE = 200
+MAX_CHARGE = 1200
+BUFFER = 100
+
 # ====================== PERSISTENT MQTT CLIENT ======================
 mqtt_client = None
 mqtt_creds = None
@@ -216,33 +220,36 @@ def get_excess_solar_watts():
 
 def should_charge(soc, excess_solar, isCharging, chargeWatt):
     """
-    Smart charging logic - NO SOC safety check.
-    Uses true_available = chargeWatt + excess_solar for accurate decision making.
+    Smart charging logic - Fixed version.
     """
-    MIN_CHARGE = 200
-    MAX_CHARGE = 1200
-    BUFFER = 100   # Leave ~100W buffer for house loads
+
+
+    # === NEW: Stop charging if battery is full and we're importing ===
+    if soc >= 99 and excess_solar < 0:
+        return False, MIN_CHARGE
 
     if isCharging:
         # === Already charging ===
         true_available = chargeWatt + excess_solar
-        new_target = true_available - BUFFER
-        new_target = max(MIN_CHARGE, min(MAX_CHARGE, new_target))
-        new_target = (new_target // 100) * 100   # Round to nearest 100
+        optimal = true_available - BUFFER
 
-        if new_target < MIN_CHARGE:
+        # If we can't even support 200W safely → stop charging
+        if optimal < MIN_CHARGE:
             return False, MIN_CHARGE
-        return True, new_target
+
+        # Otherwise, calculate safe charge rate
+        optimal = max(MIN_CHARGE, min(MAX_CHARGE, optimal))
+        optimal = (optimal // 100) * 100   # Round to nearest 100
+        return True, optimal
 
     else:
         # === Not currently charging ===
         if excess_solar > 350:
-            new_target = excess_solar - 200
-            new_target = max(MIN_CHARGE, min(MAX_CHARGE, new_target))
-            new_target = (new_target // 100) * 100
-            return True, new_target
-        return False, 200
-    
+            optimal = excess_solar - 200
+            optimal = max(MIN_CHARGE, min(MAX_CHARGE, optimal))
+            optimal = (optimal // 100) * 100
+            return True, optimal
+        return False, 200    
     
 
 # ====================== MQTT FUNCTIONS ======================
@@ -304,12 +311,13 @@ def control_charging():
     now = datetime.now(nz_tz)
     hour = now.hour
     minute = now.minute
+    quota = get_current_quota()
+    is_charging = quota.get("inv.inputWatts", 0) > 15 if quota else False
+        
 
     # === 07:00 AM sharp - Force OFF (Solar only) ===
-    if hour == 7 and minute == 0:
-        quota = get_current_quota()
-        is_charging = quota.get("inv.inputWatts", 0) > 50 if quota else False
-
+    if hour == 7 and minute <= 10:
+        
         if is_charging:
             print("07:00 AM → Force OFF (Solar only)")
             disable_backup_reserve(25, 0, 0)
@@ -320,9 +328,7 @@ def control_charging():
 
     # === 16:00 (4:00 PM) sharp - Force OFF (Solar only) ===
     if hour == 16 and minute == 0:
-        quota = get_current_quota()
-        is_charging = quota.get("inv.inputWatts", 0) > 50 if quota else False
-
+        
         if is_charging:
             print("16:00 → Force OFF (Solar only)")
             disable_backup_reserve(25, 0, 0)
@@ -331,10 +337,8 @@ def control_charging():
         time.sleep(900)
         return
 
-    # === Night charging: 21:00 → 07:00 ===
-    if hour >= 21 or hour < 7:
-        quota = get_current_quota()
-        is_charging = quota.get("inv.inputWatts", 0) > 50 if quota else False
+    # === Night charging: 23:00 → 07:00 ===
+    if hour >= 23 or hour < 7:
         current_charge_watt = quota.get("mppt.cfgChgWatts", 200) if quota else 0
 
         if not is_charging or abs(current_charge_watt - 800) > 50:
@@ -347,9 +351,8 @@ def control_charging():
         time.sleep(900)
         return
 
-        # === Smart solar window: 10:30 → 16:00 ===
-    if (hour == 10 and minute >= 30) or (11 <= hour <= 15) or (hour == 16 and minute < 0):
-        quota = get_current_quota()
+        # === Smart solar window: 10:15 → 16:15 ===
+    if (hour == 10 and minute >= 15) or (11 <= hour <= 15) or (hour == 16 and minute < 15):
         if not quota:
             print(f"[{now.strftime('%H:%M')}] ⚠️ Could not fetch quota")
             time.sleep(300)
@@ -357,33 +360,43 @@ def control_charging():
 
         soc = quota.get("pd.soc", 50)
         excess = get_excess_solar_watts()
-        is_charging = quota.get("inv.inputWatts", 0) > 50
-        current_charge_watt = quota.get("mppt.cfgChgWatts", 200)
+        input_watts = quota.get("inv.inputWatts", 0)
+        # Better detection using chgPauseFlag (more reliable)
+        is_charging = quota.get("mppt.chgPauseFlag", 0) == 0 and input_watts > 5
+        if input_watts == 0:
+            is_charging = False  # if input watts is 0, we are definitely not charging
+        current_charge_watt = quota.get("mppt.cfgChgWatts", quota.get("inv.cfgChgWatts", 200))
 
-        print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S %Z')}] SOC: {soc}% | Excess: {excess}W | Charging: {is_charging} ({current_charge_watt}W)")
-
+        print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S %Z')}] SOC: {soc}% | Excess: {excess}W | Charging: {is_charging} ({current_charge_watt}W) | Input: {input_watts}W")
+        
+        if soc == 100 and current_charge_watt != 200 and excess > BUFFER and is_charging:
+            print("Battery full, no need to maintain high charge wattage.")
+            set_ac_charging_power(MIN_CHARGE, soc, excess)
+            time.sleep(60)
+            return
+        
+        # === Status Quo Check ===
         should_charge_now, target_watts = should_charge(soc, excess, is_charging, current_charge_watt)
 
-        # === Status Quo Check ===
         if should_charge_now:
             if not is_charging:
-                # Transitioning from Solar → AC charging
-                print(f"[{now.strftime('%H:%M')}]    → Starting AC charging at {target_watts}W")
+                print(f"   → Starting AC charging at {target_watts}W")
                 enable_backup_reserve(30, soc, excess, target_watts)
                 set_ac_charging_power(target_watts, soc, excess)
             else:
-                # Already charging — check if we really need to change the power
+                if soc == 100 and target_watts > 200:
+                    target_watts = 200  # Don't charge above 200W if battery is full
                 if abs(target_watts - current_charge_watt) >= 50:
-                    print(f"[{now.strftime('%H:%M')}]    → Changing charge rate from {current_charge_watt}W to {target_watts}W")
+                    print(f"   → Adjusting charge rate: {current_charge_watt}W → {target_watts}W")
                     set_ac_charging_power(target_watts, soc, excess)
                 else:
-                    print(f"[{now.strftime('%H:%M')}]    → Status quo: Charging at {current_charge_watt}W (no change needed)")
+                    print(f"   → Status quo: Charging at {current_charge_watt}W")
         else:
             if is_charging:
-                print(f"[{now.strftime('%H:%M')}]    → Stopping charging (Solar only)")
+                print("   → Stopping charging (Solar only)")
                 disable_backup_reserve(25, soc, excess)
             else:
-                print(f"[{now.strftime('%H:%M')}]    → Status quo: Solar only (no change needed)")
+                print("   → Status quo: Solar only")
 
         time.sleep(60)  # 1 minute before next check
         return
