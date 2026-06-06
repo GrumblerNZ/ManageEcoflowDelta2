@@ -17,6 +17,8 @@ import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import urllib.parse
+
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -187,33 +189,108 @@ def notify_watt_change(new_watts: int, soc: int, excess: int):
     msg = f"🔋 <b>Charging power changed to {new_watts}W</b>\nTime: {now}\nSOC: {soc}%\nExcess: {excess}W"
     send_telegram(msg)
 
+
+# Global cache
+_enphase_token = None
+_enphase_token_time = 0
+
+def get_enphase_token():
+    """Get fresh token every ~1 hour"""
+    global _enphase_token, _enphase_token_time
+    
+    if _enphase_token and (time.time() - _enphase_token_time) < 3600:  # 1 hour
+        return _enphase_token
+    
+    try:
+        username = secrets["username"]
+        password = secrets["password"]
+        envoy_serial = secrets["serial_number"]
+
+        # Step 1: Login to Enlighten
+        data = {'user[email]': username, 'user[password]': password}
+        resp = requests.post('https://enlighten.enphaseenergy.com/login/login.json', 
+                           data=data, timeout=15)
+        resp.raise_for_status()
+        session_data = resp.json()
+        
+        # Step 2: Get token from Entrez
+        token_data = {
+            'session_id': session_data['session_id'],
+            'serial_num': envoy_serial,
+            'username': username
+        }
+        resp = requests.post('https://entrez.enphaseenergy.com/tokens', 
+                           json=token_data, timeout=15)
+        resp.raise_for_status()
+        
+        _enphase_token = resp.text.strip()
+        _enphase_token_time = time.time()
+        print(f"✅ New Enphase token acquired (expires in ~1h)")
+        return _enphase_token
+        
+    except Exception as e:
+        print(f"❌ Token refresh failed: {e}")
+        return _enphase_token  # Return old token if available
+
+
+
 # ====================== YOUR FUNCTIONS ======================
 def get_excess_solar_watts():
-    username = secrets["username"]
-    password = secrets["password"]
-    envoy_serial = secrets["serial_number"]
+    """Robust version - handles full URL in secrets"""
+    global _enphase_token
+    
+    token = get_enphase_token()
+    if not token:
+        print("⚠️ No Enphase token available")
+        return 0
 
-    data = {'user[email]': username, 'user[password]': password}
-    response = requests.post('http://enlighten.enphaseenergy.com/login/login.json?', data=data)
-    response_data = json.loads(response.text)
+    # Extract clean path from secrets["api_url"]
+    api_url = secrets.get("api_url", "https://envoy.local/production.json")
+    if api_url.startswith("http"):
+        # Extract just the path (e.g. /production.json)
+        parsed = urllib.parse.urlparse(api_url)
+        path = parsed.path or "/production.json"
+    else:
+        path = api_url
 
-    data = {'session_id': response_data['session_id'], 'serial_num': envoy_serial, 'username': username}
-    response = requests.post('http://entrez.enphaseenergy.com/tokens', json=data)
-    token_raw = response.text
+    urls_to_try = [
+        f"https://192.168.0.39{path}",           # Primary: Stable IP
+        f"https://envoy.local{path}",            # Fallback
+    ]
 
-    ENPHASE_API_URL = secrets["api_url"]
-    headers = {"Authorization": f"Bearer {token_raw}", "Accept": "application/json"}
-    response = requests.get(ENPHASE_API_URL, headers=headers, verify=False, timeout=30)
-    response.raise_for_status()
-    data = response.json()
-
-    export_power = data['consumption'][1]['wNow']
-    if isinstance(export_power, str):
+    for url in urls_to_try:
         try:
-            export_power = int(export_power)
-        except ValueError:
-            export_power = 0
-    return -export_power
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json"
+            }
+            #print(f"Trying Envoy API at: {url}")
+            
+            response = requests.get(url, headers=headers, verify=False, timeout=12)
+            
+            if response.status_code == 200:
+                data = response.json()
+                #print(f"✅ Successfully connected to {url}")
+
+                # Your original logic - return negative when exporting
+                export_power = data.get('consumption', [{}])[1].get('wNow', 0)
+                
+                if isinstance(export_power, str):
+                    try:
+                        export_power = int(export_power)
+                    except ValueError:
+                        export_power = 0
+                
+                excess = -export_power
+                #print(f"🌞 Excess Solar: {excess}W  (export_power = {export_power}W)")
+                return excess
+
+        except Exception as e:
+            print(f"⚠️ Failed {url}: {e}")
+            continue
+
+    print("❌ All Envoy URLs failed")
+    return 0
 
 
 
@@ -312,8 +389,32 @@ def control_charging():
     hour = now.hour
     minute = now.minute
     quota = get_current_quota()
-    is_charging = quota.get("inv.inputWatts", 0) > 15 if quota else False
+    if not quota:
+        print(f"[{now.strftime('%H:%M')}] ⚠️ Could not fetch quota")
+        time.sleep(300)
+        return
         
+    #input_watts = quota.get("inv.inputWatts", 0)
+    input_watts = quota.get("pd.wattsInSum") 
+
+    pdinputWatts = quota.get("pd.inputWatts", 0)
+    invinputWatts = quota.get("inv.inputWatts", 0)
+    pdWattsInSum = quota.get("pd.wattsInSum", 0)
+    print(f"[{now.strftime('%H:%M')}] Input Watts: {input_watts}W (pd.inputWatts={pdinputWatts}W, inv.inputWatts={invinputWatts}W, pd.wattsInSum={pdWattsInSum}W)")
+
+    #print(f"[{now.strftime('%H:%M')}] Input Watts: {input_watts}W")
+    output_watts = quota.get("inv.outputWatts", 0)
+    print(f"[{now.strftime('%H:%M')}] Output Watts: {output_watts}W")
+    soc = quota.get("bms_emsStatus.lcdShowSoc", 50)
+    is_charging = input_watts > output_watts or (soc >= 99 and input_watts == output_watts) if quota else False
+    
+    # Debug log for charging status
+    #pdsoc = quota.get("pd.soc", 0)
+    #lcdShowSoc = quota.get("bms_emsStatus.lcdShowSoc", 0)
+    #bmssoc = quota.get("bms_bmsStatus.soc", 0)
+    #f32LcdShowSoc = quota.get("bms_emsStatus.f32LcdShowSoc", 0)
+    #actSoc = quota.get("bms_bmsStatus.actSoc", 0)
+    #print(f"[{now.strftime('%H:%M')}] Charging Status Debug → lcdShowSoc: {lcdShowSoc} | bmssoc: {bmssoc} | f32LcdShowSoc: {f32LcdShowSoc} | actSoc: {actSoc} | pdSoc: {pdsoc} | inputWatts: {input_watts}W | outputWatts: {output_watts}W | is_charging: {is_charging}")
 
     # === 07:00 AM sharp - Force OFF (Solar only) ===
     if hour == 7 and minute <= 10:
@@ -326,8 +427,8 @@ def control_charging():
         time.sleep(600)
         return
 
-    # === 16:00 (4:00 PM) sharp - Force OFF (Solar only) ===
-    if hour == 16 and minute == 0:
+    # === 16:00 (4:15 PM) sharp - Force OFF (Solar only) ===
+    if hour == 16 and minute >= 15:
         
         if is_charging:
             print("16:00 → Force OFF (Solar only)")
@@ -358,9 +459,7 @@ def control_charging():
             time.sleep(300)
             return
 
-        soc = quota.get("pd.soc", 50)
         excess = get_excess_solar_watts()
-        input_watts = quota.get("inv.inputWatts", 0)
         # Better detection using chgPauseFlag (more reliable)
         is_charging = quota.get("mppt.chgPauseFlag", 0) == 0 and input_watts > 5
         if input_watts == 0:
@@ -387,7 +486,13 @@ def control_charging():
                 if soc == 100 and target_watts > 200:
                     target_watts = 200  # Don't charge above 200W if battery is full
                 if abs(target_watts - current_charge_watt) >= 50:
+                    #if soc is over 90, bms reduces charge wattage automatically, so new target watt = input  - output - buffer, but if that is above 200W, we can just set it to 200W and let bms handle the rest
+                    if input_watts - output_watts < target_watts and soc >= 90:
+                        target_watts = ceil_to_next_100(input_watts - output_watts - BUFFER)
+                        print(f"   → Ceiling target watts based on input/output and SOC: {target_watts}W")
                     print(f"   → Adjusting charge rate: {current_charge_watt}W → {target_watts}W")
+                    if input_watts == 0: # double confirmation of no input power before re-
+                        enable_backup_reserve(30, soc, excess, target_watts) # If input watts is 0, we might be in a weird state where BMS thinks we're charging but we're not actually getting power. In this case, re-enable backup reserve to reset the state.
                     set_ac_charging_power(target_watts, soc, excess)
                 else:
                     print(f"   → Status quo: Charging at {current_charge_watt}W")
@@ -404,6 +509,15 @@ def control_charging():
     # Default periods → Solar only
     disable_backup_reserve(25, 0, 0)
     time.sleep(300)
+
+def ceil_to_next_100(value):
+    """Ceil to next 100, max 1200"""
+    if value >= 1200:
+        return 1200
+    
+    import math
+    return min(1200, math.ceil(value / 100) * 100)
+
 
 def shutdown_mqtt():
     """Call this on clean exit."""
