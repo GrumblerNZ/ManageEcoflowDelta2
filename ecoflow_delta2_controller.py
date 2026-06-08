@@ -489,10 +489,19 @@ def control_charging():
                     #if soc is over 90, bms reduces charge wattage automatically, so new target watt = input  - output - buffer, but if that is above 200W, we can just set it to 200W and let bms handle the rest
                     if input_watts - output_watts < target_watts and soc >= 90:
                         target_watts = ceil_to_next_100(input_watts - output_watts - BUFFER)
+                        if target_watts < 0: #output is higher than input, which can happen when BMS is limiting our charge wattage but we still have excess solar. In this case, we want to set it to a safe default (200W) and reset the backup reserve state to recalculate the optimal wattage.
+                            print(f"   → Ceiling target watts negative: {target_watts}W")
+                            target_watts = 200
+                            disable_backup_reserve(25, soc, excess) # If we're in this weird state where BMS is limiting our charge wattage but we still have excess solar, disable backup reserve to reset the state. This can happen when BMS thinks we're charging at 400W but we're actually only getting 150W, so we want to reset it to recalculate the optimal wattage.
+                            time.sleep(60)  # 1 minute before next check
+                            return
+
+                        if target_watts < 200:
+                            target_watts = 200
                         print(f"   → Ceiling target watts based on input/output and SOC: {target_watts}W")
                     print(f"   → Adjusting charge rate: {current_charge_watt}W → {target_watts}W")
-                    if input_watts == 0: # double confirmation of no input power before re-
-                        enable_backup_reserve(30, soc, excess, target_watts) # If input watts is 0, we might be in a weird state where BMS thinks we're charging but we're not actually getting power. In this case, re-enable backup reserve to reset the state.
+                    #if input_watts == 0: # double confirmation of no input power before re-
+                    enable_backup_reserve(30, soc, excess, target_watts) # If input watts is 0, we might be in a weird state where BMS thinks we're charging but we're not actually getting power. In this case, re-enable backup reserve to reset the state.
                     set_ac_charging_power(target_watts, soc, excess)
                 else:
                     print(f"   → Status quo: Charging at {current_charge_watt}W")
